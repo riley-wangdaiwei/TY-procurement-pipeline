@@ -78,20 +78,24 @@ match_df = pd.DataFrame(match_results)
 # 4. Filter for valid fuzzy matches (score >= 80) 
 passed_df = match_df[match_df['匹配分数'] >= 80].copy()
 
-# add 进仓日期 and 进仓数量
+# add 进仓日期 and 进仓数量 and 进仓价格
 df_m.columns = [str(c).strip() for c in df_m.columns]
 
 date_col = None
 qty_col = None
+price_col = None
 
 for col in df_m.columns:
     if '日期' in col or '时间' in col:
         date_col = col
     if '数量' in col or '进仓' in col or '采购数量' in col:
         qty_col = col
+    if '单价' in col or '含税单价' in col or '价格' in col:
+        price_col = col
 
 if not date_col: date_col = '采购日期'
 if not qty_col: qty_col = '数量'
+if not price_col: price_col = '含税单价'
 
 # 2. Specialized inline helper function to fix the scientific float dates into clean string format
 def clean_financial_date_to_str(val):
@@ -146,6 +150,11 @@ for idx, row in passed_df.iterrows():
             new_row_data[col] = purchase_date
         elif '进仓数量' in col:
             new_row_data[col] = purchase_qty
+        # ---------------------------------------------------------
+        # 【新增修改点】：在这里把采购表的单价写入老表的“进货单价”列
+        # ---------------------------------------------------------
+        elif '进货单价' in col:
+            new_row_data[col] = pd.to_numeric(orig_row[price_col], errors='coerce') if not pd.isna(orig_row[price_col]) else 0.0
         elif '存货数量' in col:
             new_row_data[col] = new_stock_balance
         else:
@@ -154,6 +163,79 @@ for idx, row in passed_df.iterrows():
     # Append the calculated row right onto the bottom of the dataframe silently
     df_tab = pd.concat([df_tab, pd.DataFrame([new_row_data])], ignore_index=True)
     warehouse_sheets_dict[tab_name] = df_tab
+
+# add new tabs for 新品
+# Identify records that failed to match the automated threshold
+failed_df = match_df[match_df['匹配分数'] < 80].copy()
+
+if not failed_df.empty:
+    # Template schema headers matching your exact sheet structure
+    row_tuples_template = [
+        ('日期', pd.NA), ('进仓数量', 0.0), ('进仓单号', pd.NA), ('车牌号', pd.NA),
+        ('进货单价', 0.0), ('进货总价', 0.0), ('运费（元/吨）', pd.NA), ('运费', pd.NA),
+        ('卸货单价（元/吨）', pd.NA), ('卸货费', pd.NA), ('出仓数量', 0.0), ('出仓单号', pd.NA),
+        ('车牌号', pd.NA), ('装货单价', pd.NA), ('装货费', pd.NA), ('存货数量', 0.0),
+        ('均价', 0.0), ('仓储单价（元/吨/日）', pd.NA), ('存储天数', pd.NA),
+        ('仓储费（/日）', pd.NA), ('仓库名', pd.NA), ('占位符', pd.NA), ('库存金额', 0.0)
+    ]
+    _keys = [t[0] for t in row_tuples_template]
+    
+    new_pipeline_records = []
+
+    for idx, row in failed_df.iterrows():
+        new_tab_name = str(row['采购品号']).strip()
+        
+        # Pull actual procurement details directly from df_m
+        orig_row = df_m.loc[idx]
+        purchase_date = orig_row[date_col]
+        purchase_qty = pd.to_numeric(orig_row[qty_col], errors='coerce')
+        if pd.isna(purchase_qty): purchase_qty = 0.0
+        
+        # ---------------------------------------------------------
+        # 【新增修改 1】：从采购表里提取含税单价（如果没有 price_col 请直接改为 '含税单价'）
+        # ---------------------------------------------------------
+        purchase_price = pd.to_numeric(orig_row[price_col], errors='coerce') if 'price_col' in locals() else pd.to_numeric(orig_row['含税单价'], errors='coerce')
+        if pd.isna(purchase_price): purchase_price = 0.0
+        
+        # Row 0: Historical Empty Baseline (so max_idx - 1 exists downstream)
+        vals_row0 = [pd.NA] * len(_keys)
+        df_r0 = pd.DataFrame([vals_row0], columns=_keys)
+        df_r0['存货数量'] = 0.0
+        df_r0['均价'] = 0.0
+        
+        # Row 1: Active Inbound Row (with actual data injected immediately)
+        vals_row1 = [pd.NA] * len(_keys)
+        df_r1 = pd.DataFrame([vals_row1], columns=_keys)
+        df_r1['日期'] = purchase_date
+        df_r1['进仓数量'] = purchase_qty
+        
+        # ---------------------------------------------------------
+        # 【新增修改 2】：将单价和总价代入 Row 1
+        # ---------------------------------------------------------
+        df_r1['进货单价'] = purchase_price
+        df_r1['进货总价'] = purchase_qty * purchase_price
+        
+        df_r1['存货数量'] = purchase_qty  # First transaction: inventory = inbound qty
+        df_r1['均价'] = 0.0               # Let the downstream manage-loop compute this moving average
+        
+        # Combine into a perfect 2-row structure
+        df_new_tab = pd.concat([df_r0, df_r1], ignore_index=True)
+        
+        # Safely inject into the freshly re-initialized dictionary
+        warehouse_sheets_dict[new_tab_name] = df_new_tab
+        
+        # Track mapping info to pass onward
+        new_pipeline_records.append({
+            '采购品号': new_tab_name,
+            '仓库名': new_tab_name,
+            '匹配分数': row['匹配分数']
+        })
+        
+    # Append these new entries to passed_df so they flow into the downstream calculation loop smoothly
+    df_new_mapping = pd.DataFrame(new_pipeline_records)
+    passed_df = pd.concat([passed_df, df_new_mapping], ignore_index=True)
+    
+    print(f"Successfully appended {len(failed_df)} new initialized tabs to warehouse_sheets_dict.")
 
 # manage warehouse data
 # 1. Loop through each tab inside the storage container
