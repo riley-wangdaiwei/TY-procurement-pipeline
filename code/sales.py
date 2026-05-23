@@ -18,7 +18,8 @@ output_dir = "./output"
 
 sales_report_file = os.path.join(source_dir, "销售报表202605.xls")
 order_detail_file = os.path.join(source_dir, "订单明细2026年.xls")
-warehouse_output_file = os.path.join(output_dir, "仓库报表_2026-05-22_更新版.xlsx")
+current_date_str = datetime.now().strftime('%Y-%m-%d')
+warehouse_output_file = os.path.join(output_dir, f"仓库报表_{current_date_str}_更新版.xlsx")
 
 # 3. Read the source files
 df_sales = pd.read_excel(sales_report_file)

@@ -1,14 +1,14 @@
 import os
+import sys
 import pandas as pd
 from datetime import datetime
 import difflib
 
 # 1. Force jump to the exact absolute folder of this repo
-project_root = os.path.dirname(os.path.abspath(os.getcwd()))
-if os.path.exists(os.path.join(project_root, 'source')):
-    os.chdir(project_root)
-else:
-    pass
+if os.path.basename(os.getcwd()) == 'code':
+    os.chdir('..')
+elif os.path.exists(os.path.join(os.path.dirname(os.path.abspath(os.getcwd())), 'source')):
+    os.chdir(os.path.dirname(os.path.abspath(os.getcwd())))
 
 source_dir = "./source"
 output_dir = "./output"
@@ -37,42 +37,55 @@ df_journal_h.columns = [str(c).strip() for c in df_journal_h.columns]
 df_procure.columns   = [str(c).strip() for c in df_procure.columns]
 df_sales.columns     = [str(c).strip() for c in df_sales.columns]
 
-# chronological truncation to remain new dates rows
+
+# ==========================================
+# CHRONOLOGICAL TRUNCATION (FIXED LOGIC)
+# ==========================================
+
 # 1. Create independent working copies to shield raw imported matrices
 df_mine = df_journal_m.copy()
 df_hers = df_journal_h.copy()
 
-# 2. Extract and format my tracking data dates to identify the exact cutoff point
-df_mine = df_mine.dropna(subset=['日期']).copy()
-df_mine['日期'] = df_mine['日期'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
-df_mine['日期'] = pd.to_datetime(df_mine['日期'], format='%Y%m%d', errors='coerce')
+def safe_parse_yyyymmdd(df_target):
+    """Safely handles float/string dates, isolating valid 8-digit integers."""
+    df_target = df_target.dropna(subset=['日期']).copy()
+    # Force string conversion, split off decimals, clean up padding spaces
+    cleaned_strings = df_target['日期'].astype(str).str.split('.').str[0].str.strip()
+    df_target['日期'] = pd.to_datetime(cleaned_strings, format='%Y%m%d', errors='coerce')
+    # Immediately drop rows that failed parsing to prevent numeric fallback corruption
+    df_target = df_target.dropna(subset=['日期']).copy()
+    return df_target
 
+# 2. Extract and format my tracking data dates securely
+df_mine = safe_parse_yyyymmdd(df_mine)
 max_my_date = df_mine['日期'].max()
 
-# 3. Clean her date column entries to match the standardized format
-df_hers = df_hers.dropna(subset=['日期']).copy()
-df_hers['日期'] = df_hers['日期'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
-df_hers['日期'] = pd.to_datetime(df_hers['日期'], format='%Y%m%d', errors='coerce')
+# 3. Clean her date column entries identically
+df_hers = safe_parse_yyyymmdd(df_hers)
 
 # 4. Filter out and retain only her rows that contain strictly higher dates
 df_journal = df_hers[df_hers['日期'] > max_my_date].copy()
 
-# 5. Format sales tracking date column for consecutive ledger mapping workflows
+# 5. Format sales tracking date column safely
 df_sales['订单日期'] = pd.to_datetime(df_sales['订单日期'], errors='coerce')
 
-# 差额对账
+
+# ==========================================
+# RECONCILIATION PROCESSING
+# ==========================================
+
 # 1. Standardize and force numeric values across all transaction channels
 bank_cols = [c for c in ['农行', '建行', '工行', '兴业'] if c in df_journal.columns]
 for col in bank_cols:
     df_journal[col] = pd.to_numeric(df_journal[col], errors='coerce').fillna(0.0)
 
-# Target verified sales ledger column headers (image_940f45.png)
+# Target verified sales ledger column headers
 sales_amount_col = '销售总价'
 df_sales[sales_amount_col] = pd.to_numeric(df_sales[sales_amount_col], errors='coerce').fillna(0.0)
 sales_company_col = '客户名称'
 sales_companies = df_sales[sales_company_col].dropna().astype(str).str.strip().unique().tolist()
 
-# Target verified procurement ledger column headers (image_940f66.png)
+# Target verified procurement ledger column headers
 procure_amount_col = '价税合计'
 df_procure[procure_amount_col] = pd.to_numeric(df_procure[procure_amount_col], errors='coerce').fillna(0.0)
 procure_company_col = '供应商名称'
@@ -80,9 +93,6 @@ procure_companies = df_procure[procure_company_col].dropna().astype(str).str.str
 
 # 2. Iterate row by row to process transaction metrics independently
 variance_column = []
-successful_sales_matches = 0
-successful_procure_matches = 0
-valid_rows_count = 0
 
 for idx, row in df_journal.iterrows():
     company_name = str(row['摘要']).strip()
@@ -92,8 +102,6 @@ for idx, row in df_journal.iterrows():
     if current_flow == 0.0 or pd.isna(row['摘要']) or company_name in ['nan', '', 'None']:
         variance_column.append(0.0)
         continue
-        
-    valid_rows_count += 1
     
     # ROUTE A: Positive bank flow -> Match with Sales Ledger
     if current_flow > 0.0:
@@ -101,11 +109,7 @@ for idx, row in df_journal.iterrows():
         if matches:
             matched_company = matches[0]
             target_sales_amount = df_sales[df_sales[sales_company_col].astype(str).str.strip() == matched_company][sales_amount_col].sum()
-            row_variance = current_flow - target_sales_amount
-            variance_column.append(row_variance)
-            
-            if row_variance != current_flow:
-                successful_sales_matches += 1
+            variance_column.append(current_flow - target_sales_amount)
         else:
             variance_column.append(current_flow)
             
@@ -116,30 +120,37 @@ for idx, row in df_journal.iterrows():
         if matches:
             matched_company = matches[0]
             target_procure_amount = df_procure[df_procure[procure_company_col].astype(str).str.strip() == matched_company][procure_amount_col].sum()
-            row_variance = absolute_flow - target_procure_amount
-            
-            # Maintain structural negative format for outward expenditures
-            variance_column.append(-row_variance)
-            
-            if row_variance != absolute_flow:
-                successful_procure_matches += 1
+            # Maintain standard structural negative format for expenditures
+            variance_column.append(-(absolute_flow - target_procure_amount))
         else:
             variance_column.append(current_flow)
 
 # Inject calculations directly into the active tracking dataframe
 df_journal['对账差额'] = variance_column
 
-# Export
-# 1. Clean the datetime format on the original master copy for visual consistency
-df_master_output = df_journal_m.copy()
-df_master_output['日期'] = pd.to_datetime(df_master_output['日期'], errors='coerce')
 
-# 2. Recombine the historical master dataset with the newly reconciled records
+# ==========================================
+# RECOMBINATION AND EXPORT
+# ==========================================
+
+# 1. Standardize dates on my original master set to clean datetime format
+df_master_output = df_journal_m.copy()
+cleaned_master_strings = df_master_output['日期'].astype(str).str.split('.').str[0].str.strip()
+df_master_output['日期'] = pd.to_datetime(cleaned_master_strings, format='%Y%m%d', errors='coerce')
+df_master_output = df_master_output.dropna(subset=['日期']).copy()
+
+# 2. Recombine the historical master dataset with the newly processed records
 df_final_ledger = pd.concat([df_master_output, df_journal], axis=0, ignore_index=True)
 
-# 3. Generate the export file path dynamically using the current runtime date
+# 3. CRITICAL: Reformat the datetime column to a clean string format before exporting
+# This completely prevents Excel from showing '1970-01-01' or '00:00:00' hours timestamps
+df_final_ledger['日期'] = df_final_ledger['日期'].dt.strftime('%Y-%m-%d')
+
+# 4. Generate the export file path dynamically using the current runtime date
 export_file_name = f"日记账_更新版_{current_date_str}.xlsx"
 export_file_path = os.path.join(output_dir, export_file_name)
 
-# 4. Export the completed dataset into the output repository
+# 5. Export clean database records to destination file path
 df_final_ledger.to_excel(export_file_path, index=False)
+
+print(f"Success! Output exported nicely with clean formatting: {export_file_path}")
